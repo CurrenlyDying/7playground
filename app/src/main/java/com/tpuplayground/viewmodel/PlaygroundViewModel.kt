@@ -65,28 +65,39 @@ class PlaygroundViewModel(application: Application) : AndroidViewModel(applicati
         val config = _state.value.config
         _state.value = _state.value.copy(
             workloadRunning = true,
-            statusMessage = "Running: ${config.waveform.label} | ${config.matrixSize}x${config.matrixSize} | ${if (config.useNnapi) "NNAPI" else "CPU"}"
+            statusMessage = "Initializing model..."
         )
 
-        workloadEngine.start(config) { result ->
-            viewModelScope.launch {
-                val current = _state.value
-                val newLatency = addPoint(current.latencyHistory, result.timestampMs, result.latencyMs)
-                val newIntensity = addPoint(current.intensityHistory, result.timestampMs, result.currentIntensity)
-                _state.value = current.copy(
-                    latestInference = result,
-                    latencyHistory = newLatency,
-                    intensityHistory = newIntensity
-                )
+        workloadEngine.start(
+            config,
+            statusCallback = { status ->
+                viewModelScope.launch {
+                    _state.value = _state.value.copy(
+                        statusMessage = status,
+                        workloadRunning = workloadEngine.isRunning
+                    )
+                }
+            },
+            resultCallback = { result ->
+                viewModelScope.launch {
+                    val current = _state.value
+                    val newLatency = addPoint(current.latencyHistory, result.timestampMs, result.latencyMs)
+                    val newIntensity = addPoint(current.intensityHistory, result.timestampMs, result.currentIntensity)
+                    _state.value = current.copy(
+                        latestInference = result,
+                        latencyHistory = newLatency,
+                        intensityHistory = newIntensity
+                    )
+                }
             }
-        }
+        )
     }
 
     fun stopWorkload() {
         workloadEngine.stop()
         _state.value = _state.value.copy(
             workloadRunning = false,
-            statusMessage = "Stopped."
+            statusMessage = "Stopped. (was: ${workloadEngine.actualDelegate})"
         )
     }
 

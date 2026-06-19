@@ -1,6 +1,7 @@
 package com.tpuplayground.workload
 
 import android.content.Context
+import android.util.Log
 import org.tensorflow.lite.Interpreter
 import java.io.FileInputStream
 import java.nio.ByteBuffer
@@ -27,78 +28,153 @@ class TpuWorkloadEngine(private val context: Context) {
     @Volatile private var running = false
     @Volatile var config = WorkloadConfig()
         private set
+    @Volatile var actualDelegate = "none"
+        private set
+    @Volatile var lastError: String? = null
+        private set
 
     private var onResult: ((InferenceResult) -> Unit)? = null
+    private var onStatusChange: ((String) -> Unit)? = null
     private var workloadThread: Thread? = null
     private var startTimeMs = 0L
 
     val isRunning: Boolean get() = running
 
-    fun initialize(cfg: WorkloadConfig) {
-        release()
+    private fun initialize(cfg: WorkloadConfig): Boolean {
+        releaseInterpreter()
         config = cfg
 
-        val assetName = if (cfg.useNnapi) {
-            "matmul_${cfg.matrixSize}_int8.tflite"
-        } else {
-            "matmul_${cfg.matrixSize}.tflite"
+        val modelName = "matmul_${cfg.matrixSize}.tflite"
+        val modelInt8Name = "matmul_${cfg.matrixSize}_int8.tflite"
+
+        if (cfg.useNnapi) {
+            if (tryInitInterpreter(modelInt8Name, useNnapi = true)) {
+                actualDelegate = "NNAPI (int8)"
+                Log.i(TAG, "Initialized with NNAPI + int8 model")
+                return true
+            }
+            Log.w(TAG, "NNAPI + int8 failed, trying NNAPI + float32")
+
+            if (tryInitInterpreter(modelName, useNnapi = true)) {
+                actualDelegate = "NNAPI (float32)"
+                Log.i(TAG, "Initialized with NNAPI + float32 model")
+                return true
+            }
+            Log.w(TAG, "NNAPI failed entirely, falling back to CPU")
         }
 
-        val modelBuffer = loadModelFromAssets(assetName)
-            ?: loadModelFromAssets("matmul_${cfg.matrixSize}.tflite")
-            ?: loadModelFromAssets("matmul_256.tflite")!!
+        if (tryInitInterpreter(modelName, useNnapi = false)) {
+            actualDelegate = "CPU"
+            Log.i(TAG, "Initialized with CPU delegate")
+            return true
+        }
 
-        val options = Interpreter.Options().apply {
-            numThreads = 4
-            if (cfg.useNnapi) {
-                setUseNNAPI(true)
+        val fallbacks = listOf("matmul_256.tflite", "matmul_128.tflite", "matmul_64.tflite")
+        for (fb in fallbacks) {
+            if (tryInitInterpreter(fb, useNnapi = false)) {
+                actualDelegate = "CPU (fallback)"
+                Log.i(TAG, "Initialized with CPU fallback model: $fb")
+                return true
             }
         }
-        interpreter = Interpreter(modelBuffer, options)
 
-        val inputTensor = interpreter!!.getInputTensor(0)
-        val outputTensor = interpreter!!.getOutputTensor(0)
-
-        val inputBytes = inputTensor.numBytes()
-        val outputBytes = outputTensor.numBytes()
-
-        inputBuffer = ByteBuffer.allocateDirect(inputBytes).apply {
-            order(ByteOrder.nativeOrder())
-        }
-        outputBuffer = ByteBuffer.allocateDirect(outputBytes).apply {
-            order(ByteOrder.nativeOrder())
-        }
-
-        fillInputWithNoise()
+        lastError = "All model loading attempts failed"
+        Log.e(TAG, lastError!!)
+        return false
     }
 
-    fun start(workloadConfig: WorkloadConfig, callback: (InferenceResult) -> Unit) {
-        if (interpreter == null || workloadConfig.matrixSize != config.matrixSize ||
-            workloadConfig.useNnapi != config.useNnapi) {
-            initialize(workloadConfig)
+    private fun tryInitInterpreter(assetName: String, useNnapi: Boolean): Boolean {
+        return try {
+            val modelBuffer = loadModelFromAssets(assetName) ?: run {
+                Log.w(TAG, "Could not load asset: $assetName")
+                return false
+            }
+
+            val options = Interpreter.Options().apply {
+                setNumThreads(4)
+                if (useNnapi) {
+                    @Suppress("DEPRECATION")
+                    setUseNNAPI(true)
+                }
+            }
+
+            val interp = Interpreter(modelBuffer, options)
+
+            val inputTensor = interp.getInputTensor(0)
+            val outputTensor = interp.getOutputTensor(0)
+            Log.i(TAG, "Model $assetName loaded: input=${inputTensor.shape().toList()} " +
+                    "type=${inputTensor.dataType()}, output=${outputTensor.shape().toList()}")
+
+            val inBuf = ByteBuffer.allocateDirect(inputTensor.numBytes()).apply {
+                order(ByteOrder.nativeOrder())
+            }
+            val outBuf = ByteBuffer.allocateDirect(outputTensor.numBytes()).apply {
+                order(ByteOrder.nativeOrder())
+            }
+
+            // Warmup inference to catch native crashes early
+            fillBuffer(inBuf, inputTensor.dataType().name.contains("INT", ignoreCase = true))
+            inBuf.rewind()
+            outBuf.rewind()
+            interp.run(inBuf, outBuf)
+
+            interpreter = interp
+            inputBuffer = inBuf
+            outputBuffer = outBuf
+            lastError = null
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to init with $assetName (nnapi=$useNnapi): ${e.message}", e)
+            lastError = "${e.javaClass.simpleName}: ${e.message}"
+            false
+        } catch (e: Error) {
+            Log.e(TAG, "Native crash with $assetName (nnapi=$useNnapi): ${e.message}", e)
+            lastError = "Native: ${e.message}"
+            false
         }
-        config = workloadConfig
-        onResult = callback
+    }
+
+    fun start(workloadConfig: WorkloadConfig, statusCallback: (String) -> Unit, resultCallback: (InferenceResult) -> Unit) {
+        onResult = resultCallback
+        onStatusChange = statusCallback
+
+        val needsInit = interpreter == null ||
+                workloadConfig.matrixSize != config.matrixSize ||
+                workloadConfig.useNnapi != config.useNnapi
+
         running = true
         startTimeMs = System.currentTimeMillis()
 
         workloadThread = Thread({
+            if (needsInit) {
+                statusCallback("Initializing model...")
+                if (!initialize(workloadConfig)) {
+                    statusCallback("FAILED: $lastError")
+                    running = false
+                    return@Thread
+                }
+                statusCallback("Running: ${config.waveform.label} | ${config.matrixSize}x | $actualDelegate")
+            }
+            config = workloadConfig
             runWorkloadLoop()
         }, "TPU-Workload").apply {
-            priority = Thread.MAX_PRIORITY
             start()
         }
     }
 
     fun stop() {
         running = false
-        workloadThread?.join(2000)
+        workloadThread?.join(3000)
         workloadThread = null
     }
 
     fun release() {
         stop()
-        interpreter?.close()
+        releaseInterpreter()
+    }
+
+    private fun releaseInterpreter() {
+        try { interpreter?.close() } catch (_: Exception) {}
         interpreter = null
         inputBuffer = null
         outputBuffer = null
@@ -108,10 +184,10 @@ class TpuWorkloadEngine(private val context: Context) {
         val needsReinit = newConfig.matrixSize != config.matrixSize || newConfig.useNnapi != config.useNnapi
         config = newConfig
         if (needsReinit && running) {
-            val cb = onResult ?: return
+            val resCb = onResult ?: return
+            val statusCb = onStatusChange ?: { _: String -> }
             stop()
-            initialize(newConfig)
-            start(newConfig, cb)
+            start(newConfig, statusCb, resCb)
         }
     }
 
@@ -197,16 +273,18 @@ class TpuWorkloadEngine(private val context: Context) {
         }
     }
 
-    private fun fillInputWithNoise() {
-        val buf = inputBuffer ?: return
+    private fun fillBuffer(buf: ByteBuffer, isInt8: Boolean) {
         buf.rewind()
         val random = java.util.Random()
-        val isInt8 = config.useNnapi
         while (buf.hasRemaining()) {
             if (isInt8) {
                 buf.put((random.nextInt(256) - 128).toByte())
             } else {
-                buf.putFloat(random.nextFloat() * 2f - 1f)
+                if (buf.remaining() >= 4) {
+                    buf.putFloat(random.nextFloat() * 2f - 1f)
+                } else {
+                    buf.put(random.nextInt(256).toByte())
+                }
             }
         }
     }
@@ -215,13 +293,20 @@ class TpuWorkloadEngine(private val context: Context) {
         return try {
             val fd = context.assets.openFd(name)
             val stream = FileInputStream(fd.fileDescriptor)
-            stream.channel.map(
+            val mapped = stream.channel.map(
                 FileChannel.MapMode.READ_ONLY,
                 fd.startOffset,
                 fd.declaredLength
             )
-        } catch (_: Exception) {
+            fd.close()
+            mapped
+        } catch (e: Exception) {
+            Log.w(TAG, "loadModelFromAssets($name) failed: ${e.message}")
             null
         }
+    }
+
+    companion object {
+        private const val TAG = "TpuWorkload"
     }
 }
