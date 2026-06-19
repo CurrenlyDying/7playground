@@ -1,8 +1,10 @@
 package com.tpuplayground.ui.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -12,9 +14,11 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.tpuplayground.ui.components.*
+import com.tpuplayground.ui.theme.Red400
 import com.tpuplayground.viewmodel.PlaygroundState
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -26,7 +30,10 @@ fun DashboardScreen(
     onConfigChange: (com.tpuplayground.workload.WorkloadConfig) -> Unit,
     onTabSelected: (Int) -> Unit,
     onRefreshMemory: () -> Unit,
-    onClearHistory: () -> Unit
+    onClearHistory: () -> Unit,
+    onStartRecording: () -> Unit,
+    onStopRecording: () -> Unit,
+    onExport: () -> Unit
 ) {
     val tabs = listOf("Workload", "Sensors", "Memory")
 
@@ -59,7 +66,7 @@ fun DashboardScreen(
                             modifier = Modifier.size(18.dp)
                         )
                     }
-                    Spacer(Modifier.width(8.dp))
+                    Spacer(Modifier.width(4.dp))
                     IconButton(onClick = onClearHistory) {
                         Icon(Icons.Default.Delete, "Clear history", modifier = Modifier.size(20.dp))
                     }
@@ -77,7 +84,12 @@ fun DashboardScreen(
         ) {
             SensorStatusBar(snapshot = state.currentSnapshot)
 
-            Spacer(Modifier.height(4.dp))
+            RecordingBar(
+                state = state,
+                onStartRecording = onStartRecording,
+                onStopRecording = onStopRecording,
+                onExport = onExport
+            )
 
             TabRow(
                 selectedTabIndex = state.selectedTab,
@@ -100,6 +112,84 @@ fun DashboardScreen(
                 1 -> SensorsTab(state)
                 2 -> MemoryTab(state, onRefreshMemory)
             }
+        }
+    }
+}
+
+@Composable
+private fun RecordingBar(
+    state: PlaygroundState,
+    onStartRecording: () -> Unit,
+    onStopRecording: () -> Unit,
+    onExport: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        if (state.recording) {
+            Box(
+                modifier = Modifier
+                    .size(10.dp)
+                    .clip(CircleShape)
+                    .background(Red400)
+            )
+            Text(
+                "REC",
+                style = MaterialTheme.typography.labelSmall,
+                color = Red400
+            )
+            Text(
+                "${formatDuration(state.recordingDurationMs)} | ${state.recordingFrames} frames",
+                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f)
+            )
+            FilledTonalButton(
+                onClick = onStopRecording,
+                modifier = Modifier.height(30.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                colors = ButtonDefaults.filledTonalButtonColors(
+                    containerColor = Red400.copy(alpha = 0.2f)
+                )
+            ) {
+                Text("STOP", style = MaterialTheme.typography.labelSmall, color = Red400)
+            }
+        } else {
+            FilledTonalButton(
+                onClick = onStartRecording,
+                modifier = Modifier.height(30.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)
+            ) {
+                Icon(Icons.Default.FiberManualRecord, null, modifier = Modifier.size(12.dp), tint = Red400)
+                Spacer(Modifier.width(4.dp))
+                Text("Record", style = MaterialTheme.typography.labelSmall)
+            }
+
+            if (state.recordingFrames > 0 || state.lastExportPath != null) {
+                FilledTonalButton(
+                    onClick = onExport,
+                    modifier = Modifier.height(30.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)
+                ) {
+                    Icon(Icons.Default.FileDownload, null, modifier = Modifier.size(14.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("Export ZIP", style = MaterialTheme.typography.labelSmall)
+                }
+            }
+
+            state.lastExportPath?.let { path ->
+                val fileName = path.substringAfterLast("/")
+                Text(
+                    fileName,
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.weight(1f)
+                )
+            } ?: Spacer(Modifier.weight(1f))
         }
     }
 }
@@ -346,4 +436,10 @@ private fun SensorRow(label: String, value: String) {
         Text(value, style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurface)
     }
+}
+
+private fun formatDuration(ms: Long): String {
+    val s = ms / 1000
+    val m = s / 60
+    return if (m > 0) "${m}m${s % 60}s" else "${s}s"
 }

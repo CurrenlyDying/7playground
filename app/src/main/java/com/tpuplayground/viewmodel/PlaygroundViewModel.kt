@@ -3,6 +3,7 @@ package com.tpuplayground.viewmodel
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.tpuplayground.recording.SessionRecorder
 import com.tpuplayground.sensors.MemoryMapper
 import com.tpuplayground.sensors.MemoryMap
 import com.tpuplayground.sensors.RootShell
@@ -10,7 +11,6 @@ import com.tpuplayground.sensors.SensorReader
 import com.tpuplayground.sensors.SensorSnapshot
 import com.tpuplayground.workload.InferenceResult
 import com.tpuplayground.workload.TpuWorkloadEngine
-import com.tpuplayground.workload.WaveformType
 import com.tpuplayground.workload.WorkloadConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -18,12 +18,17 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import java.io.File
 
 data class TimeSeriesPoint(val timestampMs: Long, val value: Float)
 
 data class PlaygroundState(
     val rootAvailable: Boolean = false,
     val workloadRunning: Boolean = false,
+    val recording: Boolean = false,
+    val recordingFrames: Int = 0,
+    val recordingDurationMs: Long = 0,
+    val lastExportPath: String? = null,
     val config: WorkloadConfig = WorkloadConfig(),
     val currentSnapshot: SensorSnapshot? = null,
     val latestInference: InferenceResult? = null,
@@ -43,6 +48,7 @@ class PlaygroundViewModel(application: Application) : AndroidViewModel(applicati
     private val sensorReader = SensorReader(shell)
     private val memoryMapper = MemoryMapper(shell)
     private val workloadEngine = TpuWorkloadEngine(application)
+    private val recorder = SessionRecorder(application)
 
     private val _state = MutableStateFlow(PlaygroundState())
     val state: StateFlow<PlaygroundState> = _state.asStateFlow()
@@ -79,6 +85,7 @@ class PlaygroundViewModel(application: Application) : AndroidViewModel(applicati
                 }
             },
             resultCallback = { result ->
+                recorder.recordInference(result)
                 viewModelScope.launch {
                     val current = _state.value
                     val newLatency = addPoint(current.latencyHistory, result.timestampMs, result.latencyMs)
@@ -99,6 +106,37 @@ class PlaygroundViewModel(application: Application) : AndroidViewModel(applicati
             workloadRunning = false,
             statusMessage = "Stopped. (was: ${workloadEngine.actualDelegate})"
         )
+    }
+
+    fun startRecording() {
+        recorder.start(_state.value.config, workloadEngine.actualDelegate)
+        _state.value = _state.value.copy(
+            recording = true,
+            recordingFrames = 0,
+            recordingDurationMs = 0,
+            lastExportPath = null,
+            statusMessage = _state.value.statusMessage + " | REC"
+        )
+        startMemorySnapshotLoop()
+    }
+
+    fun stopRecording() {
+        recorder.stop()
+        _state.value = _state.value.copy(
+            recording = false,
+            statusMessage = _state.value.statusMessage.replace(" | REC", "")
+        )
+    }
+
+    fun exportRecording(): String? {
+        _state.value = _state.value.copy(statusMessage = "Exporting...")
+        val file = recorder.export()
+        val path = file?.absolutePath
+        _state.value = _state.value.copy(
+            lastExportPath = path,
+            statusMessage = if (path != null) "Exported: ${file.name}" else "Export failed"
+        )
+        return path
     }
 
     fun updateConfig(transform: (WorkloadConfig) -> WorkloadConfig) {
@@ -123,6 +161,7 @@ class PlaygroundViewModel(application: Application) : AndroidViewModel(applicati
         viewModelScope.launch(Dispatchers.IO) {
             val map = memoryMapper.readProcessMemoryMap()
             _state.value = _state.value.copy(memoryMap = map)
+            recorder.recordMemoryMap(map)
         }
     }
 
@@ -136,11 +175,29 @@ class PlaygroundViewModel(application: Application) : AndroidViewModel(applicati
         )
     }
 
+    private fun startMemorySnapshotLoop() {
+        viewModelScope.launch(Dispatchers.IO) {
+            while (recorder.recording) {
+                try {
+                    val map = memoryMapper.readProcessMemoryMap()
+                    _state.value = _state.value.copy(memoryMap = map)
+                    recorder.recordMemoryMap(map)
+                    _state.value = _state.value.copy(
+                        recordingFrames = recorder.frameCount,
+                        recordingDurationMs = recorder.durationMs
+                    )
+                } catch (_: Exception) {}
+                delay(5000)
+            }
+        }
+    }
+
     private fun startSensorPolling() {
         viewModelScope.launch(Dispatchers.IO) {
             while (true) {
                 try {
                     val snapshot = sensorReader.takeSnapshot()
+                    recorder.recordSensorSnapshot(snapshot)
                     val current = _state.value
 
                     val newThermals = current.thermalHistory.toMutableMap()
@@ -168,7 +225,9 @@ class PlaygroundViewModel(application: Application) : AndroidViewModel(applicati
                         currentSnapshot = snapshot,
                         thermalHistory = newThermals,
                         powerHistory = newPower,
-                        cpuFreqHistory = newCpuFreq
+                        cpuFreqHistory = newCpuFreq,
+                        recordingFrames = if (recorder.recording) recorder.frameCount else current.recordingFrames,
+                        recordingDurationMs = if (recorder.recording) recorder.durationMs else current.recordingDurationMs
                     )
                 } catch (_: Exception) {
                 }
